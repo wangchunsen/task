@@ -1,7 +1,5 @@
 package csw.task
 
-import kotlin.math.tan
-
 sealed class Task<T> {
     companion object {
         fun <R> async(func: () -> R): Task<R> = AsyncTask(ValueTask(func))

@@ -1,9 +1,7 @@
 package csw.task
 
-import csw.task.util.Either
-import csw.task.util.Left
-import csw.task.util.Right
-import java.util.concurrent.TimeoutException
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 sealed class Result<out T> {
@@ -41,17 +39,27 @@ data class Done<T>(val value: ResultValue<T>) : Result<T>() {
 
 typealias Callback<T> = (ResultValue<T>) -> Any
 
+private data class AsyncStatus<T>(
+    val value: ResultValue<T>? = null,
+    val callbacks: List<Callback<T>> = emptyList(),
+    val queue: SynchronousQueue<ResultValue<T>>? = null
+) {
+    fun addCallback(callback: Callback<T>): AsyncStatus<T> =
+        this.copy(callbacks = callbacks + callback)
+}
+
 class Async<T> : Result<T>() {
+    private val status = AtomicReference<AsyncStatus<T>>(AsyncStatus())
 
-    private val reference = AtomicReference<Either<ResultValue<T>, List<Callback<T>>>>(Either.right(emptyList()))
-
-    fun waitAndGet(timeMilliseconds: Long = 0): ResultValue<T> = when (val rs = reference.get()) {
-        is Left -> rs.value
-        else -> {
-            thisWait(timeMilliseconds)
-            when (val rs = reference.get()) {
-                is Left -> rs.value
-                else -> throw TimeoutException("Waiting timeout before this result is resolved")
+    tailrec fun waitAndGet(timeMilliseconds: Long = 0): ResultValue<T> {
+        val st = status.get()
+        return when {
+            st.value != null -> st.value
+            else -> {
+                val newStatus = st.copy(queue = SynchronousQueue())
+                if (status.compareAndSet(st, newStatus)) {
+                    newStatus.queue!!.poll(timeMilliseconds, TimeUnit.MILLISECONDS)
+                } else waitAndGet(timeMilliseconds)
             }
         }
     }
@@ -64,25 +72,23 @@ class Async<T> : Result<T>() {
     }
 
     fun done(res: ResultValue<T>) {
-        var refvalue: Either<ResultValue<T>, List<Callback<T>>>
+        var status: AsyncStatus<T>
         do {
-            refvalue = reference.get()
-            if (refvalue.isLeft()) {
+            status = this.status.get()
+            if (status.value != null) {
                 throw Exception("Value has done")
             }
-        } while (!reference.compareAndSet(refvalue, Either.left(res)))
-        val callbacks = refvalue.asRight()
+        } while (!this.status.compareAndSet(status, AsyncStatus(value = res)))
+        val callbacks = status.callbacks
         callbacks.forEach { func -> func(res) }
-
-        this.thisNotifyAll()
+        status.queue?.offer(res)
     }
 
     override tailrec fun onDone(callback: (ResultValue<T>) -> Unit) {
-        val res = reference.get()
-        when (res) {
-            is Left -> callback(res.value)
-            is Right ->
-                if (!reference.compareAndSet(res, Either.right(res.value + callback))) onDone(callback)
+        val res = status.get()
+        when {
+            res.value != null -> callback(res.value)
+            !status.compareAndSet(res, res.addCallback(callback)) -> onDone(callback)
         }
     }
 
@@ -100,18 +106,5 @@ class Async<T> : Result<T>() {
         }
     }
 
-    override fun isDone(): Boolean = when (reference.get()) {
-        is Left -> true
-        else -> false
-    }
-
-    @Synchronized
-    private fun thisWait(timeMilliseconds: Long) {
-        (this as java.lang.Object).wait(timeMilliseconds)
-    }
-
-    @Synchronized
-    private fun thisNotifyAll() {
-        (this as java.lang.Object).notifyAll()
-    }
+    override fun isDone(): Boolean = status.get().value != null
 }

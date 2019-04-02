@@ -39,7 +39,7 @@ class ExecuteContext(
 
     fun submitTask(job:Runnable):ForkJoinTask<*> = computePool.submit(job)
 
-    fun publisError(error:Throwable): Unit {
+    fun publishError(error:Throwable): Unit {
 
     }
 }
