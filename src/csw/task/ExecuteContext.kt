@@ -17,10 +17,14 @@ private fun defaultIOPool(): ThreadPoolExecutor {
 }
 
 class ExecuteContext(
-    private val computePool: ForkJoinPool = ForkJoinPool.commonPool(),
-    private val ioPool: ThreadPoolExecutor = defaultIOPool()
+    private val computePool: Lazy<ForkJoinPool> = lazy { ForkJoinPool.commonPool() },
+    private val ioPool: Lazy<ThreadPoolExecutor> = lazy { defaultIOPool() }
 ) {
-    private val timer = Executors.newScheduledThreadPool(0)
+    companion object {
+        val defaultContext: ExecuteContext by lazy { ExecuteContext() }
+    }
+
+    private val timer by lazy { Executors.newScheduledThreadPool(0) }
 
     fun schedule(func: () -> Any, delay: Long): CancelAble {
         val task = Runnable {
@@ -34,12 +38,12 @@ class ExecuteContext(
     }
 
     fun submitIO(job: Runnable) {
-        ioPool.execute(job)
+        ioPool.value.execute(job)
     }
 
-    fun submitTask(job:Runnable):ForkJoinTask<*> = computePool.submit(job)
+    fun submitTask(job: Runnable): ForkJoinTask<*> = computePool.value.submit(job)
 
-    fun publishError(error:Throwable): Unit {
-
+    fun publishError(error: Throwable): Unit {
+        "".toInt()
     }
 }

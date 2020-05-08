@@ -1,58 +1,50 @@
 package csw.task
 
-sealed class Task<T> {
+
+sealed abstract class Task<out T> {
     companion object {
-        fun <R> async(func: () -> R): Task<R> = AsyncTask(ValueTask(func))
-        fun <R> of(computer: () -> R): Task<R> = ValueTask(computer)
-        fun <R> io(computer: () -> R): Task<R> = IOTask(ValueTask(computer))
+        fun <R> async(func: () -> R): Task<R> = AsyncTask(ComputeTask(func))
+        fun <R> of(computer: () -> R): Task<R> = ComputeTask(computer)
+        fun <R> io(computer: () -> R): Task<R> = IOTask(ComputeTask(computer))
         fun <O, R> join(tasks: List<Task<O>>, joinFun: (List<O>) -> R): Task<R> {
             require(tasks.isNotEmpty()) { "Can not join empty tasks" }
             return SequenceTask(tasks = tasks.toList(), join = joinFun)
         }
     }
-
-    abstract fun <R> map(func: (T) -> R): Task<R>
-
-    abstract fun <R> flatMap(func: (T) -> Task<R>): Task<R>
 }
 
-class ValueTask<T>(val evaluator: () -> T) : Task<T>() {
-    override fun <R> map(func: (T) -> R): Task<R> = ValueTask(evaluator = { func(evaluator()) })
+fun <T, V> Task<T>.map(func: (T) -> V): Task<V> = Map(this, func)
 
-    override fun <R> flatMap(func: (T) -> Task<R>): Task<R> = FlatMappedTask(this, func)
-}
+fun <T, V> Task<T>.flatMap(func: (T) -> Task<V>): Task<V> = Bind(this, func)
 
+typealias AsyncCallback<T> = (T) -> Unit
 
-class DelayTask<T>(val task: Task<T>, val delay: Long) : Task<T>() {
-    override fun <R> map(func: (T) -> R): Task<R> =
-        DelayTask(task = task.map(func), delay = delay)
+class Pure<T>(val value: T) : Task<T>()
+class Delay<T>(val func: () -> T) : Task<T>()
+class Map<A, T>(val task: Task<A>, val func: (A) -> T) : Task<T>()
+class Bind<A, T>(val task: Task<A>, val func: (A) -> Task<T>) : Task<T>()
+class Async<T>(val callback: (AsyncCallback<T>) -> Unit) : Task<T>()
 
-    override fun <R> flatMap(func: (T) -> Task<R>): Task<R> =
-        DelayTask(task = task.flatMap(func), delay = delay)
-}
-
-class FlatMappedTask<O, T>(val task: Task<O>, val ftMap: (O) -> Task<T>) : Task<T>() {
-    override fun <V> map(func: (T) -> V): Task<V> {
-        val fmap: (O) -> Task<V> = { t -> ftMap(t).map(func) }
-        return FlatMappedTask(task = task, ftMap = fmap)
+private inline fun <A, T> Map<A,T>.run(): T = this.func(this.task.run())
+private inline fun <A, T> runBind(t: Bind<A, T>): T = t.func(t.task.run()).run()
+fun <T> Task<T>.run(): T = when (this) {
+    is Pure -> this.value
+    is Delay -> this.func()
+    is Map<*, T> -> this.run()
+    is Bind<* , T> -> runBind(this)
+    is Async -> {
+        val async = Result.async<T>()
+        this.callback { res ->
+            async.finish(res)
+        }
+        async.blockGet().value()
     }
-
-    override fun <R> flatMap(func: (T) -> Task<R>): Task<R> = FlatMappedTask(this, func)
-}
-
-class AsyncTask<T>(val task: Task<T>) : Task<T>() {
-    override fun <R> map(func: (T) -> R): Task<R> = AsyncTask(task = task.map(func))
-
-    override fun <R> flatMap(func: (T) -> Task<R>): Task<R> = AsyncTask(task = task.flatMap(func))
-}
-
-class IOTask<T>(val task: Task<T>) : Task<T>() {
-    override fun <R> map(func: (T) -> R): Task<R> = IOTask(task.map(func))
-
-    override fun <R> flatMap(func: (T) -> Task<R>): Task<R> = FlatMappedTask(task = this.task, ftMap = func)
 }
 
 
+/**
+ * Run tasks parallelly, and join the result by the join function
+ */
 class SequenceTask<O, T>(
     val tasks: List<Task<O>>,
     val join: (List<O>) -> T
@@ -77,7 +69,7 @@ class RaceTask<T>(val tasks: List<Task<T>>) : Task<T>() {
     override fun <R> flatMap(func: (T) -> Task<R>): Task<R> = FlatMappedTask(task = this, ftMap = func)
 
     override fun <R> map(func: (T) -> R): Task<R> = flatMap { t ->
-        ValueTask {
+        ComputeTask {
             func(t)
         }
     }
@@ -90,19 +82,8 @@ fun <T> Task<T>.race(other: Task<T>): Task<T> = when (this) {
     else -> RaceTask(listOf(this, other))
 }
 
+fun <T> Task<T>.execute(context: ExecuteContext = ExecuteContext.defaultContext): Result<T> =
+    TaskExecutor.init(context, this).execute()
 
-//fun <T> race(vararg tasks: Task<T>): Task<T> {
-//    require(tasks.size > 1) { "Can not race less that 2 tasks" }
-//    val tasksCount = tasks.size
-//    val failCount = AtomicInteger(tasksCount)
-//    return SequenceTask(tasks.toList()) { resultValue, _, executor ->
-//        when {
-//            resultValue.isSuccess() -> {
-//                executor.cancel()
-//                resultValue
-//            }
-//            failCount.incrementAndGet() == tasksCount -> Fail(Exception("All tasks fail"))
-//            else -> null
-//        }
-//    }
-//}
+fun <T1 : Any, T2 : Any, R> forkJoin(task1: Task<T1>, task2: Task<T2>, join: (T1, T2) -> R): Task<R> =
+    SequenceTask(listOf(task1, task2)) { list -> join(list[0] as T1, list[2] as T2) }

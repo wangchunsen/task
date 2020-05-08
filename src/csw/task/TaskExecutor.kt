@@ -22,7 +22,7 @@ class TaskExecutor<T>(
     }
 
     private val cancelled = AtomicReference<Boolean>(false)
-    private var runningTask: Pair<Task<*>, Thread>? = null
+    private val runningThread = AtomicReference<Thread>()
     private val subExecutor: LinkedList<TaskExecutor<*>> = LinkedList()
 
     /**
@@ -33,7 +33,7 @@ class TaskExecutor<T>(
             val finalResult = Async<T>()
             val job = Runnable {
                 val taskResult = taskResult(task)
-                finalResult.doneBy(taskResult)
+                finalResult.lift(taskResult)
             }
             when (type) {
                 ExecutorType.IO -> context.submitIO(job)
@@ -60,7 +60,7 @@ class TaskExecutor<T>(
         if (!cancelled.compareAndSet(false, true)) {
             return false
         }
-        runningTask?.second?.interrupt()
+        runningThread.get()?.interrupt()
         return true
     }
 
@@ -74,17 +74,16 @@ class TaskExecutor<T>(
                 is Success -> {
                     try {
                         val nextTask = task.ftMap(res.value)
-                        taskResult(nextTask).onDone(result::done)
+                        result.lift(taskResult(nextTask))
                     } catch (e: Throwable) {
-                        result.done(Fail(e))
+                        result.finish(Fail(e))
                     }
                 }
-                is Fail -> result.done(res)
+                is Fail -> result.finish(res)
             }
         }
         return result
     }
-
 
     private fun <O, T> sequenceTaskResult(taskRoot: SequenceTask<O, T>): Result<T> {
         val finalResult = Result.async<T>()
@@ -96,10 +95,10 @@ class TaskExecutor<T>(
                     val values = results.map { it.blockGet() }
                     val fails = values.filter { !it.isSuccess() }.map { (it as Fail).exception }
                     if (fails.isNotEmpty()) {
-                        finalResult.done(Fail(MultipleException(fails)))
+                        finalResult.finish(Fail(MultipleException(fails)))
                     } else {
                         val finalResultValue = taskRoot.join(values.map { (it as Success).value })
-                        finalResult.done(Success(finalResultValue))
+                        finalResult.finish(Success(finalResultValue))
                     }
                 }
             }
@@ -117,14 +116,14 @@ class TaskExecutor<T>(
         executors.forEach { executor ->
             executor.execute().onDone { resv ->
                 if (resv.isSuccess() && valueRef.compareAndSet(null, resv)) {
-                    finalResult.done(resv)
+                    finalResult.finish(resv)
                     //cancel all unfinished task
                     executors.forEach { it.cancel() }
                 } else if (resv is Fail && !finalResult.isDone()) {
                     faillings.offer(resv.exception)
                     // all racing task failed
                     if (faillings.size == task.tasks.size) {
-                        finalResult.done(Fail(MultipleException(faillings.toList())))
+                        finalResult.finish(Fail(MultipleException(faillings.toList())))
                     }
                 }
             }
@@ -132,14 +131,14 @@ class TaskExecutor<T>(
         return finalResult
     }
 
-    private fun <O> compute(task: ValueTask<O>): Result<O> {
-        runningTask = Pair(task, Thread.currentThread())
+    private fun <O> compute(task: ComputeTask<O>): Result<O> {
+        runningThread.set(Thread.currentThread())
         return try {
             Result.success((task.evaluator)())
         } catch (e: Throwable) {
             Result.fail<O>(e)
         } finally {
-            runningTask = null
+            runningThread.set(null)
             //clean interrupt state
             Thread.interrupted()
         }
@@ -149,7 +148,7 @@ class TaskExecutor<T>(
         val result = Result.async<O>()
         context.schedule({
             if (!cancelled.get()) {
-                result.doneBy(fork(task.task).execute())
+                result.lift(fork(task.task).execute())
             } else {
                 cancel(result)
             }
@@ -158,7 +157,7 @@ class TaskExecutor<T>(
     }
 
     private fun cancel(result: Async<*>) {
-        result.done(Fail(java.lang.Exception("Task cancelled")))
+        result.finish(Fail(java.lang.Exception("Task cancelled")))
     }
 
 
@@ -168,8 +167,10 @@ class TaskExecutor<T>(
             return Result.fail(Exception("Task cancelled"))
 
         return when (task) {
-            is ValueTask ->
+            is ComputeTask ->
                 compute(task)
+            is InterruptAbleTask ->
+                compute(task.task)
             is IOTask, is AsyncTask ->
                 fork(task).execute()
             is DelayTask ->
